@@ -323,18 +323,32 @@ Future<_LockLink> _connectLock({
     return false;
   }
 
-  // 1. 确保蓝牙开启（iOS 无法代开，只能提示）
-  var state = await FlutterBluePlus.adapterState.first;
-  if (state != BluetoothAdapterState.on) {
-    if (isIos) throw '蓝牙未开启，请先到控制中心打开蓝牙';
+  // 1. 确保蓝牙开启。iOS 上 CBCentralManager 初始化是异步的，首帧状态常为 unknown，
+  //    必须跳过 transient 状态等其稳定；否则首次点击会误报"蓝牙未开启"。
+  final state = await FlutterBluePlus.adapterState
+      .where((s) =>
+          s == BluetoothAdapterState.on ||
+          s == BluetoothAdapterState.off ||
+          s == BluetoothAdapterState.unauthorized)
+      .first
+      .timeout(const Duration(seconds: 4),
+          onTimeout: () => BluetoothAdapterState.unknown);
+  if (state == BluetoothAdapterState.unauthorized) {
+    throw '蓝牙权限被拒绝：请到系统设置 → 隐私与安全 → 蓝牙 里允许本应用';
+  }
+  if (state == BluetoothAdapterState.on) {
+    // 已开启
+  } else if (isIos) {
+    throw '蓝牙未开启，请先到控制中心打开蓝牙';
+  } else {
     log('蓝牙未开启，请求打开...');
     await FlutterBluePlus.turnOn();
-    state = await FlutterBluePlus.adapterState
+    final ok = await FlutterBluePlus.adapterState
         .where((s) => s == BluetoothAdapterState.on)
         .first
         .timeout(const Duration(seconds: 10),
             onTimeout: () => BluetoothAdapterState.off);
-    if (state != BluetoothAdapterState.on) {
+    if (ok != BluetoothAdapterState.on) {
       throw '蓝牙未能开启，请手动打开后重试';
     }
   }
@@ -478,6 +492,9 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    // 预热蓝牙适配器：iOS 上 CBCentralManager 初始化是异步的，提前触发可避免
+    // 首次点击开门时还在初始化而误报"蓝牙未开启"。
+    FlutterBluePlus.adapterState.first.then((_) {}).catchError((_) {});
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _loadProfiles();
       _refreshLockInfo();
