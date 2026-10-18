@@ -57,6 +57,21 @@ const Color kTextGray = Color(0xFF9AA0A8);
 const Color kCardGray = Color(0xFFF5F6F8);
 const Color kLogGray = Color(0xFF6B7280);
 
+// ==================== 全局日志中心（性能：日志不重建页面） ====================
+/// 全局日志。写日志只更新这个 ValueNotifier，不触发任何页面 setState，
+/// 避免日志频繁刷新导致整个页面重建（性能优化核心）。
+final ValueNotifier<List<String>> gLogs = ValueNotifier<List<String>>([]);
+
+void appLog(String s) {
+  final n = DateTime.now();
+  String t(int v) => v.toString().padLeft(2, '0');
+  final line = '${t(n.hour)}:${t(n.minute)}:${t(n.second)}  $s';
+  // 复用列表再整体替换，触发 notifier；上限 300 条防内存膨胀
+  final next = List<String>.from(gLogs.value)..add(line);
+  if (next.length > 300) next.removeRange(0, next.length - 300);
+  gLogs.value = next;
+}
+
 void main() {
   runApp(const DoorApp());
 }
@@ -72,10 +87,183 @@ class DoorApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
-            seedColor: kBlue, brightness: Brightness.light),
+          seedColor: kBlue,
+          brightness: Brightness.light,
+        ),
         scaffoldBackgroundColor: Colors.white,
       ),
-      home: const HomePage(),
+      home: const MainShell(),
+    );
+  }
+}
+
+// ==================== 底部 Dock 主壳（房间/公区/水电） ====================
+class MainShell extends StatefulWidget {
+  const MainShell({super.key});
+
+  @override
+  State<MainShell> createState() => _MainShellState();
+}
+
+class _MainShellState extends State<MainShell> {
+  int _tab = 0;
+  // IndexedStack 保活三页状态：切页不丢列表/不重复请求（性能优化）
+  final List<Widget> _pages = const [HomePage(), GatePage(), MeterPage()];
+
+  Future<void> _openSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SettingsPage()),
+    );
+    // 设置可能改了配置/切了 profile：通知首页刷新门锁信息
+    homeRefresh.value++;
+    if (!mounted) return;
+    if (_toastAfterSettings.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            _toastAfterSettings,
+            style: const TextStyle(fontSize: 13),
+          ),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      _toastAfterSettings = '';
+    }
+  }
+
+  void _openLogs() {
+    Navigator.push(context, MaterialPageRoute(builder: (_) => const LogPage()));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const titles = ['房间', '公区门禁', '水电抄表'];
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        title: Text(
+          titles[_tab],
+          style: const TextStyle(
+            color: kTextDark,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        actions: [
+          // 运行日志（设置左侧，避免屏幕信息杂乱）
+          IconButton(
+            icon: const Icon(Icons.receipt_long_outlined, color: kTextGray),
+            tooltip: '运行日志',
+            onPressed: _openLogs,
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings_outlined, color: kTextGray),
+            tooltip: '参数设置',
+            onPressed: _openSettings,
+          ),
+        ],
+      ),
+      body: IndexedStack(index: _tab, children: _pages),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
+        indicatorColor: kBlueSoft,
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.door_front_door_outlined),
+            selectedIcon: Icon(Icons.door_front_door, color: kBlue),
+            label: '房间',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.meeting_room_outlined),
+            selectedIcon: Icon(Icons.meeting_room, color: kBlue),
+            label: '公区',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.bolt_outlined),
+            selectedIcon: Icon(Icons.bolt, color: kBlue),
+            label: '水电',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 通知首页刷新门锁信息（设置返回后 +1 触发）
+final ValueNotifier<int> homeRefresh = ValueNotifier<int>(0);
+
+// ==================== 运行日志页 ====================
+class LogPage extends StatelessWidget {
+  const LogPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        iconTheme: const IconThemeData(color: kTextDark),
+        title: const Text(
+          '运行日志',
+          style: TextStyle(
+            color: kTextDark,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.delete_outline, color: kTextGray),
+            tooltip: '清空',
+            onPressed: () => gLogs.value = [],
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: ValueListenableBuilder<List<String>>(
+          valueListenable: gLogs,
+          builder: (_, logs, __) => logs.isEmpty
+              ? const Center(
+                  child: Text(
+                    '暂无日志',
+                    style: TextStyle(color: kTextGray, fontSize: 13),
+                  ),
+                )
+              : ListView.builder(
+                  reverse: true, // 最新在上，不用滚到底
+                  padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
+                  itemCount: logs.length,
+                  itemBuilder: (_, i) {
+                    final line = logs[logs.length - 1 - i];
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text(
+                        line,
+                        style: const TextStyle(
+                          color: kLogGray,
+                          fontSize: 11.5,
+                          height: 1.5,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ),
     );
   }
 }
@@ -88,18 +276,21 @@ class _FieldDef {
 
 // 参数字段表：label=界面显示名，desc=从哪个请求抓+含义
 const List<_FieldDef> _kFields = [
-  _FieldDef('token', 'applet-token（登录态令牌）',
-      '唯一要抓包的长串。服务端身份凭证，会过期（App 提示 401 时重抓）。\n'
-      '抓包：打开小程序，任意 weapp.szajly.com 请求的 '
-      'applet-token 请求头，整段照抄。\n'),
-  _FieldDef('mac', '门锁 MAC（蓝牙地址）',
-      '不用手填：点下方"自动获取"按钮，App 调 lock/detail 接口自动填入。'),
-  _FieldDef('tenant_id', 'tenantId（租户ID）',
-      '你的租户编号。同一个抓包请求里的 tenantId 请求头，照抄。'),
-  _FieldDef('company_id', 'companyId（公司/门店ID）',
-      '公寓运营方编号。请求头 companyId，照抄。'),
-  _FieldDef('customer_id', 'customerId（用户ID）',
-      '你的账号编号。请求头 customerId，照抄。'),
+  _FieldDef(
+    'token',
+    'applet-token（登录态令牌）',
+    '唯一要抓包的长串。服务端身份凭证，会过期（App 提示 401 时重抓）。\n'
+        '抓包：打开小程序，任意 weapp.szajly.com 请求的 '
+        'applet-token 请求头，整段照抄。\n',
+  ),
+  _FieldDef(
+    'mac',
+    '门锁 MAC（蓝牙地址）',
+    '不用手填：点下方"自动获取"按钮，App 调 lock/detail 接口自动填入。',
+  ),
+  _FieldDef('tenant_id', 'tenantId（租户ID）', '你的租户编号。同一个抓包请求里的 tenantId 请求头，照抄。'),
+  _FieldDef('company_id', 'companyId（公司/门店ID）', '公寓运营方编号。请求头 companyId，照抄。'),
+  _FieldDef('customer_id', 'customerId（用户ID）', '你的账号编号。请求头 customerId，照抄。'),
 ];
 
 // 分组显示
@@ -127,9 +318,13 @@ void _applyActive() {
 Future<void> _saveProfiles() async {
   final p = await SharedPreferences.getInstance();
   await p.setString(
-      'profiles_v2',
-      jsonEncode(_profiles
-          .map((name, v) => MapEntry(name, v.map((k, x) => MapEntry(k, x))))));
+    'profiles_v2',
+    jsonEncode(
+      _profiles.map(
+        (name, v) => MapEntry(name, v.map((k, x) => MapEntry(k, x))),
+      ),
+    ),
+  );
   await p.setString('active_profile', _activeProfile);
 }
 
@@ -171,25 +366,28 @@ Future<void> _loadProfiles() async {
 
 // ==================== 服务端 API ====================
 Map<String, String> _apiHeaders() => {
-      'applet-token': _cfgVal('token'),
-      'tenantId': _cfgVal('tenant_id'),
-      'companyId': _cfgVal('company_id'),
-      'customerId': _cfgVal('customer_id'),
-      'businessType': '1',
-      'cohabitId': '0',
-      'sessionId': '',
-      'platform': 'MiniApp',
-      'version': '1',
-      'Content-Type': 'application/json; charset=UTF-8',
-      'wxMiniAppId': kWxMiniAppId,
-      'model': kModel,
-      'system': kSystem,
-      'appVersion': kAppVersion,
-      'user-agent': kUserAgent,
-    };
+  'applet-token': _cfgVal('token'),
+  'tenantId': _cfgVal('tenant_id'),
+  'companyId': _cfgVal('company_id'),
+  'customerId': _cfgVal('customer_id'),
+  'businessType': '1',
+  'cohabitId': '0',
+  'sessionId': '',
+  'platform': 'MiniApp',
+  'version': '1',
+  'Content-Type': 'application/json; charset=UTF-8',
+  'wxMiniAppId': kWxMiniAppId,
+  'model': kModel,
+  'system': kSystem,
+  'appVersion': kAppVersion,
+  'user-agent': kUserAgent,
+};
 
 Future<Map<String, dynamic>> _apiRequest(
-    String method, String path, Map<String, dynamic>? body) async {
+  String method,
+  String path,
+  Map<String, dynamic>? body,
+) async {
   if (_cfgVal('token').isEmpty) throw '未配置 applet-token：请点右上角齿轮填写';
   final uri = Uri.parse(kBaseUrl + path);
   http.Response resp;
@@ -366,9 +564,10 @@ Future<_LockLink> _connectLock({
   final macClean = mac.toUpperCase().replaceAll(':', '');
   final macBytes = <int>[
     for (var i = 0; i < 12; i += 2)
-      int.parse(macClean.substring(i, i + 2), radix: 16)
+      int.parse(macClean.substring(i, i + 2), radix: 16),
   ];
-  final isIos = defaultTargetPlatform == TargetPlatform.iOS ||
+  final isIos =
+      defaultTargetPlatform == TargetPlatform.iOS ||
       defaultTargetPlatform == TargetPlatform.macOS;
 
   bool advHasMac(ScanResult r) {
@@ -384,13 +583,17 @@ Future<_LockLink> _connectLock({
   // 1. 确保蓝牙开启。iOS 上 CBCentralManager 初始化是异步的，首帧状态常为 unknown，
   //    必须跳过 transient 状态等其稳定；否则首次点击会误报"蓝牙未开启"。
   final state = await FlutterBluePlus.adapterState
-      .where((s) =>
-          s == BluetoothAdapterState.on ||
-          s == BluetoothAdapterState.off ||
-          s == BluetoothAdapterState.unauthorized)
+      .where(
+        (s) =>
+            s == BluetoothAdapterState.on ||
+            s == BluetoothAdapterState.off ||
+            s == BluetoothAdapterState.unauthorized,
+      )
       .first
-      .timeout(const Duration(seconds: 4),
-          onTimeout: () => BluetoothAdapterState.unknown);
+      .timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => BluetoothAdapterState.unknown,
+      );
   if (state == BluetoothAdapterState.unauthorized) {
     throw '蓝牙权限被拒绝：请到系统设置 → 隐私与安全 → 蓝牙 里允许本应用';
   }
@@ -404,8 +607,10 @@ Future<_LockLink> _connectLock({
     final ok = await FlutterBluePlus.adapterState
         .where((s) => s == BluetoothAdapterState.on)
         .first
-        .timeout(const Duration(seconds: 10),
-            onTimeout: () => BluetoothAdapterState.off);
+        .timeout(
+          const Duration(seconds: 10),
+          onTimeout: () => BluetoothAdapterState.off,
+        );
     if (ok != BluetoothAdapterState.on) {
       throw '蓝牙未能开启，请手动打开后重试';
     }
@@ -416,10 +621,15 @@ Future<_LockLink> _connectLock({
     log('用已保存的设备标识直连...');
     final d = BluetoothDevice.fromId(iosId);
     try {
-      await d.connect(timeout: const Duration(seconds: 8),
-          license: License.nonprofit);
-      final link = await _finishLink(d,
-          serviceUuid: serviceUuid, onDeviceId: onDeviceId);
+      await d.connect(
+        timeout: const Duration(seconds: 8),
+        license: License.nonprofit,
+      );
+      final link = await _finishLink(
+        d,
+        serviceUuid: serviceUuid,
+        onDeviceId: onDeviceId,
+      );
       log('直连成功');
       return link;
     } catch (e) {
@@ -447,16 +657,20 @@ Future<_LockLink> _connectLock({
   await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
   BluetoothDevice dev;
   try {
-    dev = await found.future.timeout(const Duration(seconds: 9),
-        onTimeout: () => throw '未发现门锁：请站在门边，摸一下键盘点亮屏幕唤醒锁的蓝牙后重试');
+    dev = await found.future.timeout(
+      const Duration(seconds: 9),
+      onTimeout: () => throw '未发现门锁：请站在门边，摸一下键盘点亮屏幕唤醒锁的蓝牙后重试',
+    );
   } finally {
     try {
       await FlutterBluePlus.stopScan();
     } catch (_) {}
     scanSub.cancel();
   }
-  log('发现设备: ${dev.platformName.isEmpty ? '(无名)' : dev.platformName} '
-      '${dev.remoteId.str}');
+  log(
+    '发现设备: ${dev.platformName.isEmpty ? '(无名)' : dev.platformName} '
+    '${dev.remoteId.str}',
+  );
 
   // 3. 连接 + 服务发现（弱信号下可重试）
   for (var attempt = 1; attempt <= 3; attempt++) {
@@ -464,8 +678,11 @@ Future<_LockLink> _connectLock({
       log('连接中($attempt/3)...');
       await dev.connect(license: License.nonprofit); // 个人用途免费授权
       log('已连接，发现服务...');
-      return await _finishLink(dev,
-          serviceUuid: serviceUuid, onDeviceId: onDeviceId);
+      return await _finishLink(
+        dev,
+        serviceUuid: serviceUuid,
+        onDeviceId: onDeviceId,
+      );
     } catch (e) {
       if (attempt == 3) throw '连接失败: $e';
       log('连接失败($attempt/3): $e');
@@ -528,12 +745,7 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  static const List<String> _stepTitles = [
-    '取指令并连门锁',
-    '蓝牙就绪',
-    '发送指令',
-    '确认开门',
-  ];
+  static const List<String> _stepTitles = ['取指令并连门锁', '蓝牙就绪', '发送指令', '确认开门'];
   static const List<String> _stepDescs = [
     '并行：服务端取一次性指令 + 蓝牙扫描连接',
     '连接成功，服务发现完成',
@@ -549,8 +761,6 @@ class _HomePageState extends State<HomePage> {
   Color _statusColor = kTextGray;
   String _lockSub = '正在获取门锁信息...';
   String _lockAddr = '';
-  final List<String> _logs = [];
-  final ScrollController _logCtrl = ScrollController();
 
   @override
   void initState() {
@@ -558,10 +768,22 @@ class _HomePageState extends State<HomePage> {
     // 预热蓝牙适配器：iOS 上 CBCentralManager 初始化是异步的，提前触发可避免
     // 首次点击开门时还在初始化而误报"蓝牙未开启"。
     FlutterBluePlus.adapterState.first.then((_) {}).catchError((_) {});
+    homeRefresh.addListener(_onRefreshSignal);
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _loadProfiles();
       _refreshLockInfo();
     });
+  }
+
+  @override
+  void dispose() {
+    homeRefresh.removeListener(_onRefreshSignal);
+    super.dispose();
+  }
+
+  Future<void> _onRefreshSignal() async {
+    await _loadProfiles();
+    if (mounted) _refreshLockInfo();
   }
 
   // 内部字段（如 iOS 设备标识）静默写入当前配置
@@ -570,24 +792,6 @@ class _HomePageState extends State<HomePage> {
     (_profiles[_activeProfile] ??= <String, String>{})[key] = val;
     _cfg[key] = val;
     await _saveProfiles();
-  }
-
-  Future<void> _openSettings() async {
-    await Navigator.push(
-        context, MaterialPageRoute(builder: (_) => const SettingsPage()));
-    await _loadProfiles(); // 设置可能改了配置/切换了 profile，回来后刷新
-    if (!mounted) return;
-    if (_toastAfterSettings.isNotEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text(_toastAfterSettings,
-            style: const TextStyle(fontSize: 13)),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
-      ));
-      _toastAfterSettings = '';
-    }
-    _refreshLockInfo();
-    setState(() {});
   }
 
   Future<void> _refreshLockInfo() async {
@@ -605,24 +809,13 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       if (!mounted) return;
       final mac = _cfgVal('mac');
-      setState(() =>
-          _lockSub = mac.isEmpty ? '未配置门锁信息' : '云丁智能 · $mac');
+      setState(() => _lockSub = mac.isEmpty ? '未配置门锁信息' : '云丁智能 · $mac');
       _log('门锁信息获取失败: $e');
     }
   }
 
-  void _log(String s) {
-    final n = DateTime.now();
-    final ts =
-        '${n.hour.toString().padLeft(2, '0')}:${n.minute.toString().padLeft(2, '0')}:${n.second.toString().padLeft(2, '0')}';
-    if (!mounted) return;
-    setState(() => _logs.add('$ts  $s'));
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_logCtrl.hasClients) {
-        _logCtrl.jumpTo(_logCtrl.position.maxScrollExtent);
-      }
-    });
-  }
+  // 写入全局日志中心，不触发本页 setState（性能：日志不再重建页面）
+  void _log(String s) => appLog(s);
 
   void _stepTo(int i, String msg) {
     if (!mounted) return;
@@ -648,7 +841,6 @@ class _HomePageState extends State<HomePage> {
       _success = false;
       _failedStep = -1;
       _step = -1;
-      _logs.clear();
       _status = '准备中...';
       _statusColor = kBlue;
     });
@@ -715,7 +907,12 @@ class _HomePageState extends State<HomePage> {
 
       // 写指令并等确认
       _stepTo(2, '发送开门指令...');
-      final ok = await _sendCommand(link: link, packets: packets, successHex: kRoomOk, log: (m) => _log(m));
+      final ok = await _sendCommand(
+        link: link,
+        packets: packets,
+        successHex: kRoomOk,
+        log: (m) => _log(m),
+      );
       if (!mounted) return;
 
       // 确认 + 上报
@@ -779,8 +976,11 @@ class _HomePageState extends State<HomePage> {
         child: CircularProgressIndicator(strokeWidth: 2.2, color: kBlue),
       );
     }
-    return Icon(Icons.radio_button_unchecked, color: Colors.grey.shade300,
-        size: 22);
+    return Icon(
+      Icons.radio_button_unchecked,
+      color: Colors.grey.shade300,
+      size: 22,
+    );
   }
 
   Color _stepTitleColor(int i) {
@@ -791,264 +991,165 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        surfaceTintColor: Colors.white,
-        elevation: 0,
-        centerTitle: true,
-        title: const Text('门锁开门',
-            style: TextStyle(
-                color: kTextDark, fontSize: 17, fontWeight: FontWeight.w600)),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings_outlined, color: kTextGray),
-            tooltip: '参数设置',
-            onPressed: _openSettings,
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-          children: [
-            // ---- 门锁信息卡 ----
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: kCardGray,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    width: 46,
-                    height: 46,
-                    decoration: BoxDecoration(
-                      color: kBlueSoft,
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: const Icon(Icons.door_front_door,
-                        color: kBlue, size: 26),
+    // AppBar/Dock 由 MainShell 统一提供，本页只渲染内容
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+        children: [
+          // ---- 门锁信息卡 ----
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: kCardGray,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: kBlueSoft,
+                    borderRadius: BorderRadius.circular(14),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('房门锁',
-                            style: TextStyle(
-                                color: kTextDark,
-                                fontSize: 16,
-                                fontWeight: FontWeight.w600)),
-                        const SizedBox(height: 3),
-                        Text(_lockSub,
-                            style:
-                                const TextStyle(color: kTextGray, fontSize: 12)),
-                        if (_lockAddr.isNotEmpty)
-                          Text(_lockAddr,
+                  child: const Icon(
+                    Icons.door_front_door,
+                    color: kBlue,
+                    size: 26,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '房门锁',
+                        style: TextStyle(
+                          color: kTextDark,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        _lockSub,
+                        style: const TextStyle(color: kTextGray, fontSize: 12),
+                      ),
+                      if (_lockAddr.isNotEmpty)
+                        Text(
+                          _lockAddr,
+                          style: const TextStyle(
+                            color: kTextGray,
+                            fontSize: 12,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // ---- 步骤卡 ----
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: kCardGray,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              children: List.generate(4, (i) {
+                return Padding(
+                  padding: EdgeInsets.only(bottom: i == 3 ? 0 : 14),
+                  child: Row(
+                    children: [
+                      _stepIcon(i),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _stepTitles[i],
+                              style: TextStyle(
+                                color: _stepTitleColor(i),
+                                fontSize: 14,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              _stepDescs[i],
                               style: const TextStyle(
-                                  color: kTextGray, fontSize: 12)),
-                      ],
+                                color: kTextGray,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // ---- 状态 ----
+          Text(
+            _status,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: _statusColor,
+              fontSize: 14.5,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // ---- 开门按钮 ----
+          SizedBox(
+            height: 54,
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: kBlue,
+                foregroundColor: Colors.white,
+                disabledBackgroundColor: kBlue.withValues(alpha: 0.45),
+                shape: const StadiumBorder(),
+              ),
+              onPressed: _busy ? null : _open,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    _busy
+                        ? Icons.hourglass_top_rounded
+                        : Icons.lock_open_rounded,
+                    size: 21,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _busy ? '开门中...' : '一键开门',
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ],
               ),
             ),
-            const SizedBox(height: 12),
-
-            // ---- 步骤卡 ----
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: kCardGray,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Column(
-                children: List.generate(4, (i) {
-                  return Padding(
-                    padding: EdgeInsets.only(bottom: i == 3 ? 0 : 14),
-                    child: Row(
-                      children: [
-                        _stepIcon(i),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(_stepTitles[i],
-                                  style: TextStyle(
-                                      color: _stepTitleColor(i),
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w500)),
-                              const SizedBox(height: 2),
-                              Text(_stepDescs[i],
-                                  style: const TextStyle(
-                                      color: kTextGray, fontSize: 11)),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // ---- 状态 ----
-            Text(
-              _status,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  color: _statusColor,
-                  fontSize: 14.5,
-                  fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 12),
-
-            // ---- 开门按钮 ----
-            SizedBox(
-              height: 54,
-              child: FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: kBlue,
-                  foregroundColor: Colors.white,
-                  disabledBackgroundColor: kBlue.withValues(alpha: 0.45),
-                  shape: const StadiumBorder(),
-                ),
-                onPressed: _busy ? null : _open,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(_busy ? Icons.hourglass_top_rounded : Icons.lock_open_rounded,
-                        size: 21),
-                    const SizedBox(width: 8),
-                    Text(_busy ? '开门中...' : '一键开门',
-                        style: const TextStyle(
-                            fontSize: 17, fontWeight: FontWeight.w600)),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            const Text('请站在门边操作，保持手机靠近门锁',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: kTextGray, fontSize: 11)),
-            const SizedBox(height: 14),
-
-            // ---- 公区门禁入口 ----
-            InkWell(
-              borderRadius: BorderRadius.circular(16),
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const GatePage())),
-              child: Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-                decoration: BoxDecoration(
-                    color: kCardGray, borderRadius: BorderRadius.circular(16)),
-                child: const Row(
-                  children: [
-                    Icon(Icons.door_front_door_outlined,
-                        color: kBlue, size: 22),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('公区门禁',
-                              style: TextStyle(
-                                  color: kTextDark,
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600)),
-                          Text('大门 / 侧门 / 屋面，远程开门不用贴门',
-                              style:
-                                  TextStyle(color: kTextGray, fontSize: 11)),
-                        ],
-                      ),
-                    ),
-                    Icon(Icons.chevron_right, color: kTextGray),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-
-            // ---- 水电抄表入口 ----
-            InkWell(
-              borderRadius: BorderRadius.circular(16),
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const MeterPage())),
-              child: Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-                decoration: BoxDecoration(
-                    color: kCardGray, borderRadius: BorderRadius.circular(16)),
-                child: const Row(
-                  children: [
-                    Icon(Icons.bolt_rounded, color: kOrange, size: 22),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('水电抄表',
-                              style: TextStyle(
-                                  color: kTextDark,
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w600)),
-                          Text('电表 / 水表读数、单价随时看',
-                              style:
-                                  TextStyle(color: kTextGray, fontSize: 11)),
-                        ],
-                      ),
-                    ),
-                    Icon(Icons.chevron_right, color: kTextGray),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-
-            // ---- 日志 ----
-            const Padding(
-              padding: EdgeInsets.only(left: 4, bottom: 6),
-              child: Text('运行日志',
-                  style: TextStyle(
-                      color: kTextGray,
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600)),
-            ),
-            Container(
-              height: 230,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: kCardGray,
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: _logs.isEmpty
-                  ? const Center(
-                      child: Text('暂无日志',
-                          style: TextStyle(color: kTextGray, fontSize: 12)))
-                  : ListView.builder(
-                      controller: _logCtrl,
-                      itemCount: _logs.length,
-                      itemBuilder: (_, i) => Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 1.5),
-                        child: Text(_logs[i],
-                            style: const TextStyle(
-                                color: kLogGray,
-                                fontSize: 11,
-                                height: 1.45,
-                                fontFamily: 'monospace')),
-                      ),
-                    ),
-            ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '请站在门边操作，保持手机靠近门锁',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: kTextGray, fontSize: 11),
+          ),
+          const SizedBox(height: 14),
+        ],
       ),
     );
   }
@@ -1119,8 +1220,10 @@ class _SettingsPageState extends State<SettingsPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: Colors.white,
-        title: Text(title,
-            style: const TextStyle(color: kTextDark, fontSize: 15)),
+        title: Text(
+          title,
+          style: const TextStyle(color: kTextDark, fontSize: 15),
+        ),
         content: TextField(
           controller: c,
           autofocus: true,
@@ -1131,18 +1234,21 @@ class _SettingsPageState extends State<SettingsPage> {
             filled: true,
             fillColor: kCardGray,
             border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(10),
-                borderSide: BorderSide.none),
+              borderRadius: BorderRadius.circular(10),
+              borderSide: BorderSide.none,
+            ),
           ),
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('取消', style: TextStyle(color: kTextGray))),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消', style: TextStyle(color: kTextGray)),
+          ),
           FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: kBlue),
-              onPressed: () => Navigator.pop(ctx, c.text.trim()),
-              child: const Text('确定')),
+            style: FilledButton.styleFrom(backgroundColor: kBlue),
+            onPressed: () => Navigator.pop(ctx, c.text.trim()),
+            child: const Text('确定'),
+          ),
         ],
       ),
     );
@@ -1194,18 +1300,24 @@ class _SettingsPageState extends State<SettingsPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: Colors.white,
-        title: const Text('删除配置',
-            style: TextStyle(color: kTextDark, fontSize: 15)),
-        content: Text('确定删除“$_current”？此操作不可恢复。',
-            style: const TextStyle(color: kTextDark, fontSize: 13)),
+        title: const Text(
+          '删除配置',
+          style: TextStyle(color: kTextDark, fontSize: 15),
+        ),
+        content: Text(
+          '确定删除“$_current”？此操作不可恢复。',
+          style: const TextStyle(color: kTextDark, fontSize: 13),
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('取消', style: TextStyle(color: kTextGray))),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消', style: TextStyle(color: kTextGray)),
+          ),
           FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: kOrange),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('删除')),
+            style: FilledButton.styleFrom(backgroundColor: kOrange),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
         ],
       ),
     );
@@ -1227,11 +1339,13 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(msg, style: const TextStyle(fontSize: 13)),
-      behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 2),
-    ));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg, style: const TextStyle(fontSize: 13)),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   bool _fetchingMac = false;
@@ -1256,11 +1370,16 @@ class _SettingsPageState extends State<SettingsPage> {
         'tenantId': v('tenant_id'),
         'companyId': v('company_id'),
         'customerId': v('customer_id'),
-        'businessType': '1', 'cohabitId': '0', 'sessionId': '',
-        'platform': 'MiniApp', 'version': '1',
+        'businessType': '1',
+        'cohabitId': '0',
+        'sessionId': '',
+        'platform': 'MiniApp',
+        'version': '1',
         'Content-Type': 'application/json; charset=UTF-8',
-        'wxMiniAppId': kWxMiniAppId, 'model': kModel,
-        'system': kSystem, 'appVersion': kAppVersion,
+        'wxMiniAppId': kWxMiniAppId,
+        'model': kModel,
+        'system': kSystem,
+        'appVersion': kAppVersion,
         'user-agent': kUserAgent,
       };
       final resp = await http
@@ -1294,15 +1413,19 @@ class _SettingsPageState extends State<SettingsPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(f.label,
-              style: const TextStyle(
-                  color: kTextDark,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600)),
+          Text(
+            f.label,
+            style: const TextStyle(
+              color: kTextDark,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 3),
-          Text(f.desc,
-              style:
-                  const TextStyle(color: kTextGray, fontSize: 11, height: 1.4)),
+          Text(
+            f.desc,
+            style: const TextStyle(color: kTextGray, fontSize: 11, height: 1.4),
+          ),
           const SizedBox(height: 6),
           TextField(
             controller: _ctrls[f.key],
@@ -1314,13 +1437,17 @@ class _SettingsPageState extends State<SettingsPage> {
               filled: true,
               fillColor: Colors.white,
               enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: Colors.grey.shade300)),
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: Colors.grey.shade300),
+              ),
               focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: const BorderSide(color: kBlue)),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+                borderRadius: BorderRadius.circular(10),
+                borderSide: const BorderSide(color: kBlue),
+              ),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 10,
+                vertical: 9,
+              ),
             ),
           ),
           if (f.key == 'mac') ...[
@@ -1329,18 +1456,24 @@ class _SettingsPageState extends State<SettingsPage> {
               height: 32,
               child: TextButton.icon(
                 style: TextButton.styleFrom(
-                    foregroundColor: kBlue,
-                    padding: const EdgeInsets.symmetric(horizontal: 8)),
+                  foregroundColor: kBlue,
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
                 onPressed: _fetchingMac ? null : _autoFetchMac,
                 icon: _fetchingMac
                     ? const SizedBox(
                         width: 14,
                         height: 14,
                         child: CircularProgressIndicator(
-                            strokeWidth: 2, color: kBlue))
+                          strokeWidth: 2,
+                          color: kBlue,
+                        ),
+                      )
                     : const Icon(Icons.download_outlined, size: 16),
-                label: Text(_fetchingMac ? '获取中...' : '自动获取',
-                    style: const TextStyle(fontSize: 12)),
+                label: Text(
+                  _fetchingMac ? '获取中...' : '自动获取',
+                  style: const TextStyle(fontSize: 12),
+                ),
               ),
             ),
           ],
@@ -1349,26 +1482,37 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  Widget _groupCard(String title, String subtitle, List<String> keys,
-      {Color bg = kCardGray}) {
+  Widget _groupCard(
+    String title,
+    String subtitle,
+    List<String> keys, {
+    Color bg = kCardGray,
+  }) {
     final fields = _kFields.where((f) => keys.contains(f.key)).toList();
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(14),
-      decoration:
-          BoxDecoration(color: bg, borderRadius: BorderRadius.circular(16)),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(16),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title,
-              style: const TextStyle(
-                  color: kTextDark,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600)),
+          Text(
+            title,
+            style: const TextStyle(
+              color: kTextDark,
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 2),
-          Text(subtitle,
-              style: const TextStyle(color: kTextGray, fontSize: 11)),
+          Text(
+            subtitle,
+            style: const TextStyle(color: kTextGray, fontSize: 11),
+          ),
           const SizedBox(height: 12),
           ...fields.map(_fieldTile),
         ],
@@ -1381,14 +1525,18 @@ class _SettingsPageState extends State<SettingsPage> {
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
-      decoration:
-          BoxDecoration(color: kBlueSoft, borderRadius: BorderRadius.circular(16)),
+      decoration: BoxDecoration(
+        color: kBlueSoft,
+        borderRadius: BorderRadius.circular(16),
+      ),
       child: Row(
         children: [
           Expanded(
             child: _profiles.isEmpty
-                ? const Text('还没有配置，填好下面参数后点保存',
-                    style: TextStyle(color: kTextGray, fontSize: 12.5))
+                ? const Text(
+                    '还没有配置，填好下面参数后点保存',
+                    style: TextStyle(color: kTextGray, fontSize: 12.5),
+                  )
                 : DropdownButton<String>(
                     value: _current.isEmpty ? null : _current,
                     isExpanded: true,
@@ -1396,13 +1544,17 @@ class _SettingsPageState extends State<SettingsPage> {
                     iconEnabledColor: kBlue,
                     dropdownColor: Colors.white,
                     style: const TextStyle(
-                        color: kTextDark,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600),
+                      color: kTextDark,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
                     items: _profiles.keys
-                        .map((n) => DropdownMenuItem(
+                        .map(
+                          (n) => DropdownMenuItem(
                             value: n,
-                            child: Text(n, overflow: TextOverflow.ellipsis)))
+                            child: Text(n, overflow: TextOverflow.ellipsis),
+                          ),
+                        )
                         .toList(),
                     onChanged: (v) {
                       if (v != null) _switchTo(v);
@@ -1415,8 +1567,10 @@ class _SettingsPageState extends State<SettingsPage> {
             onPressed: _newProfile,
           ),
           IconButton(
-            icon: Icon(Icons.delete_outline,
-                color: _profiles.isEmpty ? Colors.grey.shade300 : kOrange),
+            icon: Icon(
+              Icons.delete_outline,
+              color: _profiles.isEmpty ? Colors.grey.shade300 : kOrange,
+            ),
             tooltip: '删除当前配置',
             onPressed: _profiles.isEmpty ? null : _deleteProfile,
           ),
@@ -1435,9 +1589,14 @@ class _SettingsPageState extends State<SettingsPage> {
         elevation: 0,
         centerTitle: true,
         iconTheme: const IconThemeData(color: kTextDark),
-        title: const Text('参数设置',
-            style: TextStyle(
-                color: kTextDark, fontSize: 17, fontWeight: FontWeight.w600)),
+        title: const Text(
+          '参数设置',
+          style: TextStyle(
+            color: kTextDark,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
       ),
       body: SafeArea(
         child: ListView(
@@ -1450,15 +1609,20 @@ class _SettingsPageState extends State<SettingsPage> {
               margin: const EdgeInsets.only(bottom: 12),
               padding: const EdgeInsets.all(14),
               decoration: BoxDecoration(
-                  color: kCardGray, borderRadius: BorderRadius.circular(16)),
+                color: kCardGray,
+                borderRadius: BorderRadius.circular(16),
+              ),
               child: const Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('参数从哪来（一次性抓包）',
-                      style: TextStyle(
-                          color: kBlue,
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.w600)),
+                  Text(
+                    '参数从哪来（一次性抓包）',
+                    style: TextStyle(
+                      color: kBlue,
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                   SizedBox(height: 6),
                   Text(
                     '1. 电脑开 Charles / mitmproxy，手机挂代理并装证书\n'
@@ -1466,14 +1630,21 @@ class _SettingsPageState extends State<SettingsPage> {
                     '3. 抓任意一个 weapp.szajly.com 的请求，把 applet-token、tenantId、'
                     'companyId、customerId 四个请求头抄进来\n'
                     '4. MAC 不用抄，回这里点“自动获取”。多把锁就新建多个配置，一键切换。',
-                    style:
-                        TextStyle(color: kTextDark, fontSize: 11.5, height: 1.5),
+                    style: TextStyle(
+                      color: kTextDark,
+                      fontSize: 11.5,
+                      height: 1.5,
+                    ),
                   ),
                 ],
               ),
             ),
-            _groupCard('必填', 'token 抓包照抄；MAC 点“自动获取”即可', _groupRequired,
-                bg: kBlueSoft),
+            _groupCard(
+              '必填',
+              'token 抓包照抄；MAC 点“自动获取”即可',
+              _groupRequired,
+              bg: kBlueSoft,
+            ),
             _groupCard('身份信息', '同一个抓包请求里的请求头，照抄即可', _groupIdentity),
             Row(
               children: [
@@ -1510,7 +1681,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-
 // ==================== 公区门禁页 ====================
 class GatePage extends StatefulWidget {
   const GatePage({super.key});
@@ -1524,7 +1694,6 @@ class _GatePageState extends State<GatePage> {
   String? _error;
   List<Map<String, dynamic>> _doors = [];
   final Set<int> _opening = {};
-  final List<String> _logs = [];
 
   @override
   void initState() {
@@ -1532,20 +1701,18 @@ class _GatePageState extends State<GatePage> {
     _load();
   }
 
-  void _log(String s) {
-    final n = DateTime.now();
-    String two(int v) => v.toString().padLeft(2, '0');
-    if (!mounted) return;
-    setState(() => _logs.add('${two(n.hour)}:${two(n.minute)}:${two(n.second)}  $s'));
-  }
+  // 写全局日志，不重建本页
+  void _log(String s) => appLog(s);
 
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(msg, style: const TextStyle(fontSize: 13)),
-      behavior: SnackBarBehavior.floating,
-      duration: const Duration(seconds: 2),
-    ));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg, style: const TextStyle(fontSize: 13)),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   Future<void> _load() async {
@@ -1653,8 +1820,9 @@ class _GatePageState extends State<GatePage> {
       margin: const EdgeInsets.only(right: 6),
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
       decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(6)),
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(6),
+      ),
       child: Text(text, style: TextStyle(color: color, fontSize: 10.5)),
     );
   }
@@ -1663,15 +1831,18 @@ class _GatePageState extends State<GatePage> {
     final id = d['id'];
     final remote = d['isSupportRemote'] == '1';
     final network = d['isSupportNetwork'] == '1';
-    final hasBle = (d['miniKey'] ?? '').toString().isNotEmpty &&
+    final hasBle =
+        (d['miniKey'] ?? '').toString().isNotEmpty &&
         (d['deviceMac'] ?? '').toString().isNotEmpty;
     final busy = _opening.contains(id);
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.all(14),
-      decoration:
-          BoxDecoration(color: kCardGray, borderRadius: BorderRadius.circular(16)),
+      decoration: BoxDecoration(
+        color: kCardGray,
+        borderRadius: BorderRadius.circular(16),
+      ),
       child: Row(
         children: [
           const Icon(Icons.meeting_room_outlined, color: kBlue, size: 26),
@@ -1680,14 +1851,19 @@ class _GatePageState extends State<GatePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(d['deviceName'] ?? '门禁',
-                    style: const TextStyle(
-                        color: kTextDark,
-                        fontSize: 14.5,
-                        fontWeight: FontWeight.w600)),
+                Text(
+                  d['deviceName'] ?? '门禁',
+                  style: const TextStyle(
+                    color: kTextDark,
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 const SizedBox(height: 2),
-                Text(d['address'] ?? '',
-                    style: const TextStyle(color: kTextGray, fontSize: 11.5)),
+                Text(
+                  d['address'] ?? '',
+                  style: const TextStyle(color: kTextGray, fontSize: 11.5),
+                ),
                 const SizedBox(height: 6),
                 Row(
                   children: [
@@ -1700,40 +1876,47 @@ class _GatePageState extends State<GatePage> {
             ),
           ),
           const SizedBox(width: 8),
+          // 蓝牙/远程两个按钮等大等宽，避免误点
           Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: hasBle ? kBlue : Colors.grey.shade300,
-                  foregroundColor: Colors.white,
-                  shape: const StadiumBorder(),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 0),
-                  minimumSize: const Size(0, 34),
+              SizedBox(
+                width: 92,
+                height: 34,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: hasBle ? kBlue : Colors.grey.shade300,
+                    foregroundColor: Colors.white,
+                    shape: const StadiumBorder(),
+                    padding: EdgeInsets.zero,
+                  ),
+                  onPressed: (!hasBle || busy) ? null : () => _bleOpen(d),
+                  child: busy
+                      ? const SizedBox(
+                          width: 15,
+                          height: 15,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Text('蓝牙开门', style: TextStyle(fontSize: 12.5)),
                 ),
-                onPressed: (!hasBle || busy) ? null : () => _bleOpen(d),
-                child: busy
-                    ? const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Colors.white))
-                    : const Text('蓝牙开门', style: TextStyle(fontSize: 13)),
               ),
               if (remote) ...[
-                const SizedBox(height: 6),
+                const SizedBox(height: 8),
                 SizedBox(
-                  height: 26,
+                  width: 92,
+                  height: 34,
                   child: OutlinedButton(
                     style: OutlinedButton.styleFrom(
-                      foregroundColor: kTextGray,
-                      side: BorderSide(color: Colors.grey.shade300),
+                      foregroundColor: kBlue,
+                      side: const BorderSide(color: kBlue),
                       shape: const StadiumBorder(),
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      padding: EdgeInsets.zero,
                     ),
                     onPressed: busy ? null : () => _openDoor(d),
-                    child: const Text('远程开门', style: TextStyle(fontSize: 11)),
+                    child: const Text('远程开门', style: TextStyle(fontSize: 12.5)),
                   ),
                 ),
               ],
@@ -1746,59 +1929,35 @@ class _GatePageState extends State<GatePage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        surfaceTintColor: Colors.white,
-        elevation: 0,
-        centerTitle: true,
-        iconTheme: const IconThemeData(color: kTextDark),
-        title: const Text('公区门禁',
-            style: TextStyle(
-                color: kTextDark, fontSize: 17, fontWeight: FontWeight.w600)),
-        actions: [
-          IconButton(
-              icon: const Icon(Icons.refresh, color: kTextGray),
-              onPressed: _load),
-        ],
-      ),
-      body: SafeArea(
-        child: _loading
-            ? const Center(child: CircularProgressIndicator(color: kBlue))
-            : _error != null
-                ? Center(
-                    child: Text(_error!,
-                        style: const TextStyle(color: kOrange, fontSize: 13)))
-                : ListView(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-                    children: [
-                      ..._doors.map(_doorCard),
-                      if (_logs.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        const Text('运行日志',
-                            style: TextStyle(
-                                color: kTextGray,
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.w600)),
-                        const SizedBox(height: 6),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                              color: kCardGray,
-                              borderRadius: BorderRadius.circular(12)),
-                          child: Text(_logs.reversed.take(20).join('\n'),
-                              style: const TextStyle(
-                                  color: kLogGray,
-                                  fontSize: 11,
-                                  height: 1.45,
-                                  fontFamily: 'monospace')),
-                        ),
-                      ],
-                    ],
+    // AppBar/Dock 由 MainShell 统一提供，本页只渲染内容；下拉刷新
+    return SafeArea(
+      child: _loading
+          ? const Center(child: CircularProgressIndicator(color: kBlue))
+          : _error != null
+          ? RefreshIndicator(
+              color: kBlue,
+              onRefresh: _load,
+              child: ListView(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(40),
+                    child: Text(
+                      _error!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: kOrange, fontSize: 13),
+                    ),
                   ),
-      ),
+                ],
+              ),
+            )
+          : RefreshIndicator(
+              color: kBlue,
+              onRefresh: _load,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                children: _doors.map(_doorCard).toList(),
+              ),
+            ),
     );
   }
 }
@@ -1903,7 +2062,9 @@ class _MeterPageState extends State<MeterPage> {
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-          color: kCardGray, borderRadius: BorderRadius.circular(16)),
+        color: kCardGray,
+        borderRadius: BorderRadius.circular(16),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1923,24 +2084,27 @@ class _MeterPageState extends State<MeterPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(isElec ? '电表' : '水表',
-                        style: const TextStyle(
-                            color: kTextDark,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600)),
+                    Text(
+                      isElec ? '电表' : '水表',
+                      style: const TextStyle(
+                        color: kTextDark,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                     const SizedBox(height: 2),
                     Text(
-                      [brand, (d['deviceNo'] ?? '').toString()]
-                          .where((s) => s.isNotEmpty)
-                          .join(' · '),
+                      [
+                        brand,
+                        (d['deviceNo'] ?? '').toString(),
+                      ].where((s) => s.isNotEmpty).join(' · '),
                       style: const TextStyle(color: kTextGray, fontSize: 11),
                     ),
                   ],
                 ),
               ),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
                   color: online
                       ? kGreen.withValues(alpha: 0.12)
@@ -1959,10 +2123,13 @@ class _MeterPageState extends State<MeterPage> {
                       ),
                     ),
                     const SizedBox(width: 4),
-                    Text(online ? '在线' : '离线',
-                        style: TextStyle(
-                            color: online ? kGreen : Colors.grey.shade600,
-                            fontSize: 10.5)),
+                    Text(
+                      online ? '在线' : '离线',
+                      style: TextStyle(
+                        color: online ? kGreen : Colors.grey.shade600,
+                        fontSize: 10.5,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1972,27 +2139,35 @@ class _MeterPageState extends State<MeterPage> {
           Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Text(reading,
-                  style: TextStyle(
-                      color: accent,
-                      fontSize: 34,
-                      fontWeight: FontWeight.w700,
-                      height: 1.0,
-                      fontFamily: 'monospace')),
+              Text(
+                reading,
+                style: TextStyle(
+                  color: accent,
+                  fontSize: 34,
+                  fontWeight: FontWeight.w700,
+                  height: 1.0,
+                  fontFamily: 'monospace',
+                ),
+              ),
               const SizedBox(width: 6),
               Padding(
                 padding: const EdgeInsets.only(bottom: 4),
-                child: Text(unit,
-                    style: const TextStyle(
-                        color: kTextGray,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500)),
+                child: Text(
+                  unit,
+                  style: const TextStyle(
+                    color: kTextGray,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
               ),
               const Spacer(),
               Padding(
                 padding: const EdgeInsets.only(bottom: 4),
-                child: Text('单价 $price 元/$unit',
-                    style: const TextStyle(color: kTextGray, fontSize: 12)),
+                child: Text(
+                  '单价 $price 元/$unit',
+                  style: const TextStyle(color: kTextGray, fontSize: 12),
+                ),
               ),
             ],
           ),
@@ -2007,13 +2182,13 @@ class _MeterPageState extends State<MeterPage> {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.info_outline,
-                      color: kOrange, size: 15),
+                  const Icon(Icons.info_outline, color: kOrange, size: 15),
                   const SizedBox(width: 6),
                   Expanded(
-                    child: Text('待结算水量 $unpaid 吨 · 已用 $used 吨',
-                        style: const TextStyle(
-                            color: kOrange, fontSize: 12)),
+                    child: Text(
+                      '待结算水量 $unpaid 吨 · 已用 $used 吨',
+                      style: const TextStyle(color: kOrange, fontSize: 12),
+                    ),
                   ),
                 ],
               ),
@@ -2023,14 +2198,18 @@ class _MeterPageState extends State<MeterPage> {
           Row(
             children: [
               if (addr.isNotEmpty) ...[
-                const Icon(Icons.location_on_outlined,
-                    color: kTextGray, size: 13),
+                const Icon(
+                  Icons.location_on_outlined,
+                  color: kTextGray,
+                  size: 13,
+                ),
                 const SizedBox(width: 3),
                 Expanded(
-                  child: Text(addr,
-                      overflow: TextOverflow.ellipsis,
-                      style:
-                          const TextStyle(color: kTextGray, fontSize: 11.5)),
+                  child: Text(
+                    addr,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: kTextGray, fontSize: 11.5),
+                  ),
                 ),
               ],
             ],
@@ -2038,8 +2217,10 @@ class _MeterPageState extends State<MeterPage> {
           if (updated.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 3),
-              child: Text('$updated 更新',
-                  style: const TextStyle(color: kTextGray, fontSize: 11)),
+              child: Text(
+                '$updated 更新',
+                style: const TextStyle(color: kTextGray, fontSize: 11),
+              ),
             ),
         ],
       ),
@@ -2048,51 +2229,35 @@ class _MeterPageState extends State<MeterPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        surfaceTintColor: Colors.white,
-        elevation: 0,
-        centerTitle: true,
-        iconTheme: const IconThemeData(color: kTextDark),
-        title: const Text('水电抄表',
-            style: TextStyle(
-                color: kTextDark, fontSize: 17, fontWeight: FontWeight.w600)),
-        actions: [
-          IconButton(
-              icon: const Icon(Icons.refresh, color: kTextGray),
-              onPressed: _load),
-        ],
-      ),
-      body: SafeArea(
-        child: _loading
-            ? const Center(child: CircularProgressIndicator(color: kBlue))
-            : _error != null && _meters.isEmpty
-                ? RefreshIndicator(
-                    color: kBlue,
-                    onRefresh: _load,
-                    child: ListView(
-                      children: [
-                        Padding(
-                          padding: const EdgeInsets.all(40),
-                          child: Text(_error!,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                  color: kOrange, fontSize: 13)),
-                        ),
-                      ],
-                    ),
-                  )
-                : RefreshIndicator(
-                    color: kBlue,
-                    onRefresh: _load,
-                    child: ListView(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                      children: _meters.map(_meterCard).toList(),
+    // AppBar/Dock 由 MainShell 统一提供，本页只渲染内容
+    return SafeArea(
+      child: _loading
+          ? const Center(child: CircularProgressIndicator(color: kBlue))
+          : _error != null && _meters.isEmpty
+          ? RefreshIndicator(
+              color: kBlue,
+              onRefresh: _load,
+              child: ListView(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(40),
+                    child: Text(
+                      _error!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: kOrange, fontSize: 13),
                     ),
                   ),
-      ),
+                ],
+              ),
+            )
+          : RefreshIndicator(
+              color: kBlue,
+              onRefresh: _load,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                children: _meters.map(_meterCard).toList(),
+              ),
+            ),
     );
   }
 }
