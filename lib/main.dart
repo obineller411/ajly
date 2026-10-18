@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -101,6 +102,9 @@ String _cfgVal(String key) => _cfg[key] ?? '';
 // 全部配置文件 + 激活名
 final Map<String, Map<String, String>> _profiles = {};
 String _activeProfile = '';
+
+// 设置页保存成功后带回首页显示的提示
+String _toastAfterSettings = '';
 
 void _applyActive() {
   final prof = _profiles[_activeProfile] ?? {};
@@ -422,6 +426,15 @@ class _HomePageState extends State<HomePage> {
         context, MaterialPageRoute(builder: (_) => const SettingsPage()));
     await _loadProfiles(); // 设置可能改了配置/切换了 profile，回来后刷新
     if (!mounted) return;
+    if (_toastAfterSettings.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(_toastAfterSettings,
+            style: const TextStyle(fontSize: 13)),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ));
+      _toastAfterSettings = '';
+    }
     _refreshLockInfo();
     setState(() {});
   }
@@ -473,6 +486,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _ensurePermissions() async {
+    // iOS/macOS 不走 permission_handler：其 PERMISSION_* 编译宏在 SPM 集成下
+    // 默认关闭，request() 会误报"永久拒绝"且系统弹窗不出现。
+    // iOS 上 CoreBluetooth 首次使用时自动弹系统蓝牙授权，无需（也不能）代劳。
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.macOS) {
+      _log('iOS 蓝牙授权将由系统弹窗询问');
+      return;
+    }
     final statuses = await [
       Permission.locationWhenInUse,
       Permission.bluetoothScan,
@@ -959,6 +980,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _activeProfile = _current;
     await _saveProfiles();
     _applyActive();
+    _toastAfterSettings = '已保存配置「$_current」，已生效';
     if (mounted) Navigator.pop(context);
   }
 
@@ -1038,8 +1060,14 @@ class _SettingsPageState extends State<SettingsPage> {
   // 用表单里的 token+身份信息调 lock/detail，把 MAC（和门锁地址）自动填回来
   Future<void> _autoFetchMac() async {
     String v(String k) => _clean(k, _ctrls[k]!.text);
-    if (v('token').isEmpty) {
-      _toast('请先填 applet-token');
+    // 先本地校验，缺什么直接说明，避免服务端笼统报"身份信息不完整"
+    final missing = <String>[];
+    if (v('token').isEmpty) missing.add('applet-token');
+    if (v('tenant_id').isEmpty) missing.add('tenantId');
+    if (v('company_id').isEmpty) missing.add('companyId');
+    if (v('customer_id').isEmpty) missing.add('customerId');
+    if (missing.isNotEmpty) {
+      _toast('还差 ${missing.join('、')}，先填好再点自动获取');
       return;
     }
     setState(() => _fetchingMac = true);
