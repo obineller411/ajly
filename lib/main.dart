@@ -241,16 +241,92 @@ class _LockLink {
   }
 }
 
+bool _bytesContain(List<int> hay, List<int> needle) {
+  if (needle.isEmpty || hay.length < needle.length) return false;
+  for (var i = 0; i <= hay.length - needle.length; i++) {
+    var ok = true;
+    for (var j = 0; j < needle.length; j++) {
+      if (hay[i + j] != needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/// 连接后的服务发现 + 特征选取（写=0x0002 notify=0x0003，HCI 日志实测）
+Future<_LockLink> _finishLink(
+  BluetoothDevice dev, {
+  void Function(String deviceId)? onDeviceId,
+}) async {
+  final services = await dev.discoverServices();
+  BluetoothCharacteristic? notifyCh, writeCh;
+  BluetoothService? svc;
+  for (final s in services) {
+    // 必须用 str128：fbp 的 str 对 16-bit UUID 返回 "0001" 短形式
+    if (s.uuid.str128.toLowerCase() == kRoomServiceUuid) svc = s;
+  }
+  if (svc != null) {
+    for (final c in svc.characteristics) {
+      if (notifyCh == null && (c.properties.notify || c.properties.indicate)) {
+        notifyCh = c;
+      }
+      if (writeCh == null &&
+          (c.properties.write || c.properties.writeWithoutResponse)) {
+        writeCh = c;
+      }
+    }
+  }
+  // 兜底：按特征 UUID 精确匹配
+  if (notifyCh == null || writeCh == null) {
+    for (final s in services) {
+      for (final c in s.characteristics) {
+        final u = c.uuid.str128.toLowerCase();
+        if (u == kWriteCharUuid) writeCh ??= c;
+        if (u == kNotifyCharUuid) notifyCh ??= c;
+      }
+    }
+  }
+  if (notifyCh == null || writeCh == null) {
+    throw '缺少 notify/write 特征';
+  }
+  if (onDeviceId != null) onDeviceId(dev.remoteId.str);
+  return _LockLink(dev, notifyCh, writeCh);
+}
+
 /// 扫描 -> 连接 -> 发现服务，返回可写链路。扫到目标立即停扫（不死等超时）。
+/// iOS 不暴露 MAC（remoteId 是不透明 UUID）：与小程序同款方案——按
+/// "广播数据包含锁 MAC 字节"识别；首次成功后记住 iOS 设备标识，之后直连免扫描。
 Future<_LockLink> _connectLock({
   required String mac,
+  String? iosId,
   required void Function(String) log,
+  void Function(String deviceId)? onDeviceId,
 }) async {
   final macClean = mac.toUpperCase().replaceAll(':', '');
+  final macBytes = <int>[
+    for (var i = 0; i < 12; i += 2)
+      int.parse(macClean.substring(i, i + 2), radix: 16)
+  ];
+  final isIos = defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.macOS;
 
-  // 1. 确保蓝牙开启
+  bool advHasMac(ScanResult r) {
+    for (final d in r.advertisementData.manufacturerData.values) {
+      if (_bytesContain(d, macBytes)) return true;
+    }
+    for (final d in r.advertisementData.serviceData.values) {
+      if (_bytesContain(d, macBytes)) return true;
+    }
+    return false;
+  }
+
+  // 1. 确保蓝牙开启（iOS 无法代开，只能提示）
   var state = await FlutterBluePlus.adapterState.first;
   if (state != BluetoothAdapterState.on) {
+    if (isIos) throw '蓝牙未开启，请先到控制中心打开蓝牙';
     log('蓝牙未开启，请求打开...');
     await FlutterBluePlus.turnOn();
     state = await FlutterBluePlus.adapterState
@@ -263,14 +339,35 @@ Future<_LockLink> _connectLock({
     }
   }
 
-  // 2. 扫描目标锁（只认精确 MAC；找到立即停扫）
-  log('扫描门锁 $mac ...');
+  // 2a. iOS：有历史设备标识时先尝试直连（免扫描）
+  if (isIos && iosId != null && iosId.isNotEmpty) {
+    log('用已保存的设备标识直连...');
+    final d = BluetoothDevice.fromId(iosId);
+    try {
+      await d.connect(timeout: const Duration(seconds: 8),
+          license: License.nonprofit);
+      final link = await _finishLink(d, onDeviceId: onDeviceId);
+      log('直连成功');
+      return link;
+    } catch (e) {
+      log('直连失败($e)，改用扫描识别...');
+      try {
+        await d.disconnect();
+      } catch (_) {}
+    }
+  }
+
+  // 2b. 扫描目标锁（找到立即停扫）
+  log(isIos ? '扫描门锁（广播识别 $mac）...' : '扫描门锁 $mac ...');
   final found = Completer<BluetoothDevice>();
   final scanSub = FlutterBluePlus.scanResults.listen((rs) {
     for (final r in rs) {
-      final a = r.device.remoteId.str.toUpperCase().replaceAll(':', '');
-      if (a == macClean && !found.isCompleted) {
-        found.complete(r.device);
+      if (found.isCompleted) break;
+      if (isIos) {
+        if (advHasMac(r)) found.complete(r.device);
+      } else {
+        final a = r.device.remoteId.str.toUpperCase().replaceAll(':', '');
+        if (a == macClean) found.complete(r.device);
       }
     }
   });
@@ -289,47 +386,13 @@ Future<_LockLink> _connectLock({
       '${dev.remoteId.str}');
 
   // 3. 连接 + 服务发现（弱信号下可重试）
-  BluetoothCharacteristic? notifyCh, writeCh;
   for (var attempt = 1; attempt <= 3; attempt++) {
     try {
       log('连接中($attempt/3)...');
       await dev.connect(license: License.nonprofit); // 个人用途免费授权
       log('已连接，发现服务...');
-      final services = await dev.discoverServices();
-      BluetoothService? svc;
-      for (final s in services) {
-        // 必须用 str128：fbp 的 str 对 16-bit UUID 返回 "0001" 短形式
-        if (s.uuid.str128.toLowerCase() == kRoomServiceUuid) svc = s;
-      }
-      if (svc != null) {
-        for (final c in svc.characteristics) {
-          if (notifyCh == null &&
-              (c.properties.notify || c.properties.indicate)) {
-            notifyCh = c;
-          }
-          if (writeCh == null &&
-              (c.properties.write || c.properties.writeWithoutResponse)) {
-            writeCh = c;
-          }
-        }
-      }
-      // 兜底：按特征 UUID 精确匹配（HCI 日志实测：写=0x0002  notify=0x0003）
-      if (notifyCh == null || writeCh == null) {
-        for (final s in services) {
-          for (final c in s.characteristics) {
-            final u = c.uuid.str128.toLowerCase();
-            if (u == kWriteCharUuid) writeCh ??= c;
-            if (u == kNotifyCharUuid) notifyCh ??= c;
-          }
-        }
-      }
-      if (notifyCh == null || writeCh == null) {
-        throw '缺少 notify/write 特征';
-      }
-      return _LockLink(dev, notifyCh, writeCh);
+      return await _finishLink(dev, onDeviceId: onDeviceId);
     } catch (e) {
-      notifyCh = null;
-      writeCh = null;
       if (attempt == 3) throw '连接失败: $e';
       log('连接失败($attempt/3): $e');
       try {
@@ -419,6 +482,14 @@ class _HomePageState extends State<HomePage> {
       await _loadProfiles();
       _refreshLockInfo();
     });
+  }
+
+  // 内部字段（如 iOS 设备标识）静默写入当前配置
+  Future<void> _saveProfileField(String key, String val) async {
+    if (_activeProfile.isEmpty) return;
+    (_profiles[_activeProfile] ??= <String, String>{})[key] = val;
+    _cfg[key] = val;
+    await _saveProfiles();
   }
 
   Future<void> _openSettings() async {
@@ -556,7 +627,16 @@ class _HomePageState extends State<HomePage> {
       // 并行：取一次性开门指令 + 蓝牙连接门锁
       _stepTo(0, '并行获取指令与连接门锁...');
       cmdFuture = _apiRequest('POST', kPathOpen, {});
-      linkFuture = _connectLock(mac: mac, log: (m) => _log(m));
+      linkFuture = _connectLock(
+        mac: mac,
+        iosId: _cfgVal('ios_id'),
+        onDeviceId: (id) {
+          if (id.isNotEmpty && id != _cfgVal('ios_id')) {
+            _saveProfileField('ios_id', id); // 首次成功后记住，之后 iOS 直连
+          }
+        },
+        log: (m) => _log(m),
+      );
 
       // 指令先回来先解析；蓝牙连上后写指令
       final c = await cmdFuture;
@@ -932,6 +1012,11 @@ class _SettingsPageState extends State<SettingsPage> {
       final v = _clean(f.key, _ctrls[f.key]!.text);
       if (v.isNotEmpty) out[f.key] = v;
     }
+    // 保留内部字段（iOS 设备标识），否则保存表单会把它冲掉
+    final old = _profiles[_current];
+    if (old != null && old['ios_id'] != null) {
+      out['ios_id'] = old['ios_id']!;
+    }
     return out;
   }
 
@@ -1002,6 +1087,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (_current.isNotEmpty) _profiles[_current] = _formData();
     // 以当前表单内容为模板，通常只需改 token 和 MAC
     _profiles[name] = _formData();
+    _profiles[name]!.remove('ios_id'); // 新配置对应另一把锁，不继承设备标识
     _current = name;
     _activeProfile = name;
     await _saveProfiles();
