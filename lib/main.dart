@@ -13,10 +13,15 @@ const String kBaseUrl = 'https://weapp.szajly.com';
 const String kPathDetail = '/api/wechat/smart/lock/detail';
 const String kPathOpen = '/api/wechat/smart/lock/open';
 const String kPathRecord = '/api/wechat/smart/lock/open/record/result';
+// 公区门禁：列表接口返回每把锁的静态 miniKey（即整条 BLE 指令）
+const String kPathDoorList = '/api/wechat/smart/door/control';
 // 公区门禁
 const String kPathGateList = '/api/wechat/smart/door/control';
 const String kPathGateRemoteOpen = '/api/wechat/smart/door/control/remote/open';
 const String kPathGateOpenRecord = '/api/wechat/smart/door/control/open/record';
+// 水电抄表：电表=GET deviceType=2；水表=POST body {"deviceType":3}
+const String kPathMeterList = '/api/wechat/smart/device/detail';
+const String kPathWaterInfo = '/api/wechat/water/getInfo';
 
 // 小程序固定标识（实测服务端不校验，全平台统一）
 const String kWxMiniAppId = 'wxb8f1a397304ee2ba';
@@ -25,9 +30,15 @@ const String kSystem = 'Windows 11 x64';
 const String kAppVersion = '4.1.15.13';
 
 const String kRoomServiceUuid = '00000001-0000-1000-8000-00805f9b34fb';
+// 公区门禁服务（M503）
+const String kDoorServiceUuid = '0886b765-9f76-6472-96ef-ab19c539878a';
 // 开门服务内特征（HCI 日志实测）：0x0002 写指令 / 0x0003 回包通知
 const String kWriteCharUuid = '00000002-0000-1000-8000-00805f9b34fb';
 const String kNotifyCharUuid = '00000003-0000-1000-8000-00805f9b34fb';
+
+// 成功回码
+const String kRoomOk = 'EE08';
+const String kDoorOk = 'AC01C8';
 
 // WAF 校验 UA，必须伪装成微信小程序（与实测可用的请求头保持一致）
 const String kUserAgent =
@@ -256,9 +267,55 @@ bool _bytesContain(List<int> hay, List<int> needle) {
   return false;
 }
 
-/// 连接后的服务发现 + 特征选取（写=0x0002 notify=0x0003，HCI 日志实测）
+/// 蓝牙权限检查（房门锁 + 公区门禁共用）。iOS 由 CoreBluetooth 自动弹系统授权。
+Future<void> _ensureBlePermissions(void Function(String)? log) async {
+  if (defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.macOS) {
+    log?.call('iOS 蓝牙授权将由系统弹窗询问');
+    return;
+  }
+  final statuses = await [
+    Permission.locationWhenInUse,
+    Permission.bluetoothScan,
+    Permission.bluetoothConnect,
+  ].request();
+  final denied = statuses.entries
+      .where((e) => !e.value.isGranted && !e.value.isLimited)
+      .toList();
+  if (denied.isNotEmpty) {
+    throw '蓝牙/定位权限未授予，请到系统设置里开启';
+  }
+  try {
+    final locOn = await Permission.locationWhenInUse.serviceStatus.isEnabled;
+    if (!locOn) {
+      log?.call('提示: 旧安卓系统需开启系统定位服务才能扫描蓝牙');
+    }
+  } catch (_) {}
+}
+
+/// 公区门禁 iOS 设备标识缓存（按门 id 分别保存，避免不同门互相覆盖）
+Future<Map<String, String>> _loadGateIosIds() async {
+  final p = await SharedPreferences.getInstance();
+  final raw = p.getString('gate_ios_ids_v1');
+  if (raw == null) return {};
+  try {
+    return Map<String, String>.from(jsonDecode(raw) as Map);
+  } catch (_) {
+    return {};
+  }
+}
+
+Future<void> _saveGateIosId(String doorId, String iosId) async {
+  final p = await SharedPreferences.getInstance();
+  final map = await _loadGateIosIds();
+  map[doorId] = iosId;
+  await p.setString('gate_ios_ids_v1', jsonEncode(map));
+}
+
+/// 连接后的服务发现 + 特征选取
 Future<_LockLink> _finishLink(
   BluetoothDevice dev, {
+  String serviceUuid = kRoomServiceUuid,
   void Function(String deviceId)? onDeviceId,
 }) async {
   final services = await dev.discoverServices();
@@ -266,7 +323,7 @@ Future<_LockLink> _finishLink(
   BluetoothService? svc;
   for (final s in services) {
     // 必须用 str128：fbp 的 str 对 16-bit UUID 返回 "0001" 短形式
-    if (s.uuid.str128.toLowerCase() == kRoomServiceUuid) svc = s;
+    if (s.uuid.str128.toLowerCase() == serviceUuid) svc = s;
   }
   if (svc != null) {
     for (final c in svc.characteristics) {
@@ -279,7 +336,7 @@ Future<_LockLink> _finishLink(
       }
     }
   }
-  // 兜底：按特征 UUID 精确匹配
+  // 兜底：按特征 UUID 精确匹配（房门锁 0x0002/0x0003；公区锁用属性匹配即可）
   if (notifyCh == null || writeCh == null) {
     for (final s in services) {
       for (final c in s.characteristics) {
@@ -302,6 +359,7 @@ Future<_LockLink> _finishLink(
 Future<_LockLink> _connectLock({
   required String mac,
   String? iosId,
+  String serviceUuid = kRoomServiceUuid,
   required void Function(String) log,
   void Function(String deviceId)? onDeviceId,
 }) async {
@@ -360,7 +418,8 @@ Future<_LockLink> _connectLock({
     try {
       await d.connect(timeout: const Duration(seconds: 8),
           license: License.nonprofit);
-      final link = await _finishLink(d, onDeviceId: onDeviceId);
+      final link = await _finishLink(d,
+          serviceUuid: serviceUuid, onDeviceId: onDeviceId);
       log('直连成功');
       return link;
     } catch (e) {
@@ -405,7 +464,8 @@ Future<_LockLink> _connectLock({
       log('连接中($attempt/3)...');
       await dev.connect(license: License.nonprofit); // 个人用途免费授权
       log('已连接，发现服务...');
-      return await _finishLink(dev, onDeviceId: onDeviceId);
+      return await _finishLink(dev,
+          serviceUuid: serviceUuid, onDeviceId: onDeviceId);
     } catch (e) {
       if (attempt == 3) throw '连接失败: $e';
       log('连接失败($attempt/3): $e');
@@ -418,10 +478,11 @@ Future<_LockLink> _connectLock({
   throw '连接失败';
 }
 
-/// 订阅 -> 写 9A 帧指令 -> 等 EE08（时序对齐小程序）
+/// 订阅 -> 写指令帧 -> 等成功回码
 Future<bool> _sendCommand({
   required _LockLink link,
   required List<List<int>> packets,
+  required String successHex,
   required void Function(String) log,
 }) async {
   final n = link.notifyCh;
@@ -430,7 +491,9 @@ Future<bool> _sendCommand({
   final vsub = n.onValueReceived.listen((value) {
     final hx = bytesHex(value);
     log('回包: $hx');
-    if (hx.contains('EE08') && !ee.isCompleted) ee.complete();
+    if (hx.contains(successHex.toUpperCase()) && !ee.isCompleted) {
+      ee.complete();
+    }
   });
   try {
     await n.setNotifyValue(true);
@@ -444,7 +507,7 @@ Future<bool> _sendCommand({
         await Future.delayed(const Duration(milliseconds: 250));
       }
     }
-    log('等待锁确认 (EE08) ...');
+    log('等待锁确认 ($successHex) ...');
     try {
       await ee.future.timeout(const Duration(seconds: 20));
       return true;
@@ -574,31 +637,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _ensurePermissions() async {
-    // iOS/macOS 不走 permission_handler：其 PERMISSION_* 编译宏在 SPM 集成下
-    // 默认关闭，request() 会误报"永久拒绝"且系统弹窗不出现。
-    // iOS 上 CoreBluetooth 首次使用时自动弹系统蓝牙授权，无需（也不能）代劳。
-    if (defaultTargetPlatform == TargetPlatform.iOS ||
-        defaultTargetPlatform == TargetPlatform.macOS) {
-      _log('iOS 蓝牙授权将由系统弹窗询问');
-      return;
-    }
-    final statuses = await [
-      Permission.locationWhenInUse,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-    ].request();
-    final denied = statuses.entries
-        .where((e) => !e.value.isGranted && !e.value.isLimited)
-        .toList();
-    if (denied.isNotEmpty) {
-      throw '蓝牙/定位权限未授予，请到系统设置里开启';
-    }
-    try {
-      final locOn = await Permission.locationWhenInUse.serviceStatus.isEnabled;
-      if (!locOn) {
-        _log('提示: 旧安卓系统需开启系统定位服务才能扫描蓝牙');
-      }
-    } catch (_) {}
+    await _ensureBlePermissions((m) => _log(m));
   }
 
   Future<void> _open() async {
@@ -676,7 +715,7 @@ class _HomePageState extends State<HomePage> {
 
       // 写指令并等确认
       _stepTo(2, '发送开门指令...');
-      final ok = await _sendCommand(link: link, packets: packets, log: (m) => _log(m));
+      final ok = await _sendCommand(link: link, packets: packets, successHex: kRoomOk, log: (m) => _log(m));
       if (!mounted) return;
 
       // 确认 + 上报
@@ -925,6 +964,43 @@ class _HomePageState extends State<HomePage> {
                                   fontSize: 14,
                                   fontWeight: FontWeight.w600)),
                           Text('大门 / 侧门 / 屋面，远程开门不用贴门',
+                              style:
+                                  TextStyle(color: kTextGray, fontSize: 11)),
+                        ],
+                      ),
+                    ),
+                    Icon(Icons.chevron_right, color: kTextGray),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+
+            // ---- 水电抄表入口 ----
+            InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const MeterPage())),
+              child: Container(
+                width: double.infinity,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+                decoration: BoxDecoration(
+                    color: kCardGray, borderRadius: BorderRadius.circular(16)),
+                child: const Row(
+                  children: [
+                    Icon(Icons.bolt_rounded, color: kOrange, size: 22),
+                    SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('水电抄表',
+                              style: TextStyle(
+                                  color: kTextDark,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600)),
+                          Text('电表 / 水表读数、单价随时看',
                               style:
                                   TextStyle(color: kTextGray, fontSize: 11)),
                         ],
@@ -1499,7 +1575,11 @@ class _GatePageState extends State<GatePage> {
     setState(() => _opening.add(id));
     _log('远程开门: $name (id=$id) ...');
     try {
-      final r = await _apiRequest('POST', kPathGateRemoteOpen, {'id': id});
+      // 抓包确认的真实参数：extCommunityId + devSn（字段名是 devSn，不是 deviceSn）
+      final r = await _apiRequest('POST', kPathGateRemoteOpen, {
+        'extCommunityId': door['extCommunityId'],
+        'devSn': (door['deviceSn'] ?? '').toString(),
+      });
       if (r['code'] == 200) {
         _log('$name 开门成功');
         _toast('$name 已远程开启');
@@ -1512,6 +1592,58 @@ class _GatePageState extends State<GatePage> {
       _log('$name 异常: $e');
       _toast('$e');
     } finally {
+      if (mounted) setState(() => _opening.remove(id));
+    }
+  }
+
+  /// 蓝牙开门：用接口返回的静态 miniKey 作为整条 BLE 指令写入公区门禁服务，
+  /// 等待 AC01C8 成功回码。与抓包一致：AC 01 05 + 16 字节 ECB，单包写完。
+  Future<void> _bleOpen(Map<String, dynamic> door) async {
+    final id = door['id'];
+    final name = door['deviceName'] ?? '门禁';
+    final mac = (door['deviceMac'] ?? '').toString();
+    final miniKey = (door['miniKey'] ?? '').toString();
+    if (mac.isEmpty || miniKey.isEmpty) {
+      _toast('该门禁缺少蓝牙开门所需信息');
+      return;
+    }
+    setState(() => _opening.add(id));
+    _log('蓝牙开门: $name ($mac) ...');
+    _LockLink? link;
+    try {
+      await _ensureBlePermissions((m) => _log(m));
+      final iosIds = await _loadGateIosIds();
+      final iosId = iosIds[id.toString()];
+      link = await _connectLock(
+        mac: mac,
+        iosId: iosId,
+        serviceUuid: kDoorServiceUuid,
+        onDeviceId: (devId) {
+          if (devId.isNotEmpty && devId != iosId) {
+            _saveGateIosId(id.toString(), devId); // 首次成功后按门记住 iOS 标识
+          }
+        },
+        log: (m) => _log(m),
+      );
+      final ok = await _sendCommand(
+        link: link,
+        packets: [hexToBytes(miniKey)],
+        successHex: kDoorOk,
+        log: (m) => _log(m),
+      );
+      if (ok) {
+        _log('$name 蓝牙开门成功');
+        _toast('$name 已开启');
+        HapticFeedback.mediumImpact();
+      } else {
+        _log('$name 未收到确认($kDoorOk)');
+        _toast('开门失败：未收到门禁确认');
+      }
+    } catch (e) {
+      _log('$name 蓝牙开门异常: $e');
+      _toast('$e');
+    } finally {
+      link?.close();
       if (mounted) setState(() => _opening.remove(id));
     }
   }
@@ -1531,6 +1663,8 @@ class _GatePageState extends State<GatePage> {
     final id = d['id'];
     final remote = d['isSupportRemote'] == '1';
     final network = d['isSupportNetwork'] == '1';
+    final hasBle = (d['miniKey'] ?? '').toString().isNotEmpty &&
+        (d['deviceMac'] ?? '').toString().isNotEmpty;
     final busy = _opening.contains(id);
     return Container(
       width: double.infinity,
@@ -1566,21 +1700,44 @@ class _GatePageState extends State<GatePage> {
             ),
           ),
           const SizedBox(width: 8),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: remote ? kBlue : Colors.grey.shade300,
-              foregroundColor: Colors.white,
-              shape: const StadiumBorder(),
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-            ),
-            onPressed: (!remote || busy) ? null : () => _openDoor(d),
-            child: busy
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: Colors.white))
-                : const Text('开门', style: TextStyle(fontSize: 13.5)),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: hasBle ? kBlue : Colors.grey.shade300,
+                  foregroundColor: Colors.white,
+                  shape: const StadiumBorder(),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 0),
+                  minimumSize: const Size(0, 34),
+                ),
+                onPressed: (!hasBle || busy) ? null : () => _bleOpen(d),
+                child: busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: Colors.white))
+                    : const Text('蓝牙开门', style: TextStyle(fontSize: 13)),
+              ),
+              if (remote) ...[
+                const SizedBox(height: 6),
+                SizedBox(
+                  height: 26,
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: kTextGray,
+                      side: BorderSide(color: Colors.grey.shade300),
+                      shape: const StadiumBorder(),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                    onPressed: busy ? null : () => _openDoor(d),
+                    child: const Text('远程开门', style: TextStyle(fontSize: 11)),
+                  ),
+                ),
+              ],
+            ],
           ),
         ],
       ),
@@ -1640,6 +1797,300 @@ class _GatePageState extends State<GatePage> {
                         ),
                       ],
                     ],
+                  ),
+      ),
+    );
+  }
+}
+
+// ==================== 水电抄表页 ====================
+class MeterPage extends StatefulWidget {
+  const MeterPage({super.key});
+
+  @override
+  State<MeterPage> createState() => _MeterPageState();
+}
+
+class _MeterEntry {
+  final bool isElectric; // true=电表(度) false=水表(吨)
+  final Map<String, dynamic> data;
+  const _MeterEntry(this.isElectric, this.data);
+}
+
+class _MeterPageState extends State<MeterPage> {
+  bool _loading = true;
+  String? _error;
+  List<_MeterEntry> _meters = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<List<_MeterEntry>> _fetchElectric() async {
+    final d = await _apiRequest('GET', '$kPathMeterList?deviceType=2', null);
+    if (d['code'] != 200) throw '电表: ${d['msg'] ?? d['code']}';
+    final list = (d['data'] as List? ?? [])
+        .map((e) => _MeterEntry(true, Map<String, dynamic>.from(e as Map)))
+        .toList();
+    return list;
+  }
+
+  Future<List<_MeterEntry>> _fetchWater() async {
+    final d = await _apiRequest('POST', kPathWaterInfo, {'deviceType': 3});
+    if (d['code'] != 200) throw '水表: ${d['msg'] ?? d['code']}';
+    final list = (d['data'] as List? ?? [])
+        .map((e) => _MeterEntry(false, Map<String, dynamic>.from(e as Map)))
+        .toList();
+    return list;
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      // 电表/水表并行拉取，单边失败不拖垮另一边
+      final rs = await Future.wait<List<_MeterEntry>>([
+        _fetchElectric().catchError((_) => <_MeterEntry>[]),
+        _fetchWater().catchError((_) => <_MeterEntry>[]),
+      ]);
+      final all = [...rs[0], ...rs[1]];
+      if (!mounted) return;
+      setState(() {
+        _meters = all;
+        _loading = false;
+        if (all.isEmpty) _error = '未查询到水电表数据';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _loading = false;
+      });
+    }
+  }
+
+  String _num(dynamic v, {String def = '0.00'}) {
+    if (v == null) return def;
+    if (v is num) return v.toStringAsFixed(2);
+    return '$v';
+  }
+
+  String _fmtTime(String? t) {
+    if (t == null || t.isEmpty) return '';
+    return t; // 服务端格式已可读: 2026-10-18 20:15:04
+  }
+
+  Widget _meterCard(_MeterEntry m) {
+    final d = m.data;
+    final isElec = m.isElectric;
+    final unit = isElec ? '度' : '吨';
+    final accent = isElec ? kOrange : kBlue;
+    final icon = isElec ? Icons.bolt_rounded : Icons.water_drop_rounded;
+    final reading = _num(d['instantValue'] ?? d['instantDeviceValue']);
+    final price = _num(d['price']);
+    final addr = (d['propertyAdrrLink'] ?? '').toString();
+    final brand = (d['brandName'] ?? '').toString();
+    final online = d['onlineState'] == 1;
+    final updated = _fmtTime((d['updateTime'] ?? '').toString());
+    final unpaid = isElec ? null : _num(d['unPaidQuantity']);
+    final used = isElec ? null : _num(d['usedQuantity']);
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+          color: kCardGray, borderRadius: BorderRadius.circular(16)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: accent, size: 24),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(isElec ? '电表' : '水表',
+                        style: const TextStyle(
+                            color: kTextDark,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(
+                      [brand, (d['deviceNo'] ?? '').toString()]
+                          .where((s) => s.isNotEmpty)
+                          .join(' · '),
+                      style: const TextStyle(color: kTextGray, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: online
+                      ? kGreen.withValues(alpha: 0.12)
+                      : Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: online ? kGreen : Colors.grey.shade500,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(online ? '在线' : '离线',
+                        style: TextStyle(
+                            color: online ? kGreen : Colors.grey.shade600,
+                            fontSize: 10.5)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(reading,
+                  style: TextStyle(
+                      color: accent,
+                      fontSize: 34,
+                      fontWeight: FontWeight.w700,
+                      height: 1.0,
+                      fontFamily: 'monospace')),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(unit,
+                    style: const TextStyle(
+                        color: kTextGray,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500)),
+              ),
+              const Spacer(),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text('单价 $price 元/$unit',
+                    style: const TextStyle(color: kTextGray, fontSize: 12)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (!isElec && unpaid != null) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: kOrange.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline,
+                      color: kOrange, size: 15),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text('待结算水量 $unpaid 吨 · 已用 $used 吨',
+                        style: const TextStyle(
+                            color: kOrange, fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          Row(
+            children: [
+              if (addr.isNotEmpty) ...[
+                const Icon(Icons.location_on_outlined,
+                    color: kTextGray, size: 13),
+                const SizedBox(width: 3),
+                Expanded(
+                  child: Text(addr,
+                      overflow: TextOverflow.ellipsis,
+                      style:
+                          const TextStyle(color: kTextGray, fontSize: 11.5)),
+                ),
+              ],
+            ],
+          ),
+          if (updated.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text('$updated 更新',
+                  style: const TextStyle(color: kTextGray, fontSize: 11)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.white,
+        elevation: 0,
+        centerTitle: true,
+        iconTheme: const IconThemeData(color: kTextDark),
+        title: const Text('水电抄表',
+            style: TextStyle(
+                color: kTextDark, fontSize: 17, fontWeight: FontWeight.w600)),
+        actions: [
+          IconButton(
+              icon: const Icon(Icons.refresh, color: kTextGray),
+              onPressed: _load),
+        ],
+      ),
+      body: SafeArea(
+        child: _loading
+            ? const Center(child: CircularProgressIndicator(color: kBlue))
+            : _error != null && _meters.isEmpty
+                ? RefreshIndicator(
+                    color: kBlue,
+                    onRefresh: _load,
+                    child: ListView(
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(40),
+                          child: Text(_error!,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  color: kOrange, fontSize: 13)),
+                        ),
+                      ],
+                    ),
+                  )
+                : RefreshIndicator(
+                    color: kBlue,
+                    onRefresh: _load,
+                    child: ListView(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                      children: _meters.map(_meterCard).toList(),
+                    ),
                   ),
       ),
     );
