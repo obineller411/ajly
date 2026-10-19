@@ -243,7 +243,7 @@ class LogPage extends StatelessWidget {
                   ),
                 )
               : ListView.builder(
-                  reverse: true, // 最新在上，不用滚到底
+                  // 数据源已按最新在前排序，第一行即最新日志
                   padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
                   itemCount: logs.length,
                   itemBuilder: (_, i) {
@@ -771,7 +771,8 @@ class _HomePageState extends State<HomePage> {
     homeRefresh.addListener(_onRefreshSignal);
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _loadProfiles();
-      _refreshLockInfo();
+      // 配置就绪：通知所有页（含本页刷新门锁信息 + 公区/水电首次加载）
+      homeRefresh.value++;
     });
   }
 
@@ -1698,7 +1699,18 @@ class _GatePageState extends State<GatePage> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // 配置就绪信号驱动加载（IndexedStack 下 initState 早于配置加载完成）
+    homeRefresh.addListener(_onSignal);
+  }
+
+  @override
+  void dispose() {
+    homeRefresh.removeListener(_onSignal);
+    super.dispose();
+  }
+
+  Future<void> _onSignal() async {
+    await _load();
   }
 
   // 写全局日志，不重建本页
@@ -1984,7 +1996,18 @@ class _MeterPageState extends State<MeterPage> {
   @override
   void initState() {
     super.initState();
-    _load();
+    // 配置就绪信号驱动加载（IndexedStack 下 initState 早于配置加载完成）
+    homeRefresh.addListener(_onSignal);
+  }
+
+  @override
+  void dispose() {
+    homeRefresh.removeListener(_onSignal);
+    super.dispose();
+  }
+
+  Future<void> _onSignal() async {
+    await _load();
   }
 
   Future<List<_MeterEntry>> _fetchElectric() async {
@@ -2006,6 +2029,15 @@ class _MeterPageState extends State<MeterPage> {
   }
 
   Future<void> _load() async {
+    if (_cfgVal('token').isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '未配置 applet-token：请点右上角齿轮填写';
+        _meters = [];
+      });
+      return;
+    }
     setState(() {
       _loading = true;
       _error = null;
@@ -2055,8 +2087,12 @@ class _MeterPageState extends State<MeterPage> {
     final brand = (d['brandName'] ?? '').toString();
     final online = d['onlineState'] == 1;
     final updated = _fmtTime((d['updateTime'] ?? '').toString());
-    final unpaid = isElec ? null : _num(d['unPaidQuantity']);
+    final unpaid = _num(d['unPaidQuantity']);
     final used = isElec ? null : _num(d['usedQuantity']);
+    // 应付金额 = 待结算量 × 单价
+    final unpaidVal = double.tryParse('${d['unPaidQuantity']}') ?? 0;
+    final priceVal = double.tryParse('${d['price']}') ?? 0;
+    final due = (unpaidVal * priceVal).toStringAsFixed(2);
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 12),
@@ -2172,7 +2208,7 @@ class _MeterPageState extends State<MeterPage> {
             ],
           ),
           const SizedBox(height: 12),
-          if (!isElec && unpaid != null) ...[
+          if (unpaidVal > 0) ...[
             Container(
               width: double.infinity,
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -2186,8 +2222,18 @@ class _MeterPageState extends State<MeterPage> {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      '待结算水量 $unpaid 吨 · 已用 $used 吨',
+                      isElec
+                          ? '待结算电量 $unpaid 度'
+                          : '待结算水量 $unpaid 吨${used != null ? ' · 已用 $used 吨' : ''}',
                       style: const TextStyle(color: kOrange, fontSize: 12),
+                    ),
+                  ),
+                  Text(
+                    '应付 ¥$due',
+                    style: const TextStyle(
+                      color: kOrange,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
                 ],
